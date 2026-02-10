@@ -12,7 +12,7 @@ ALPHA_THRESHOLD = 1
 # 2 = right view
 # 3 = left view
 # 4 = diagonal/angle
-# 5 = sole (uniform color, low detail, very flat, fills bbox)
+# 5 = sole
 
 
 def read_rgba(path):
@@ -165,8 +165,7 @@ def score_image(path):
         return None
 
     mask = alpha_mask(rgba)
-    bb = bbox_from_mask(mask)
-    if bb is None:
+    if bbox_from_mask(mask) is None:
         return None
 
     areas = connected_components_areas(mask)
@@ -177,12 +176,12 @@ def score_image(path):
         a1 = areas[1]
         pair_score = float(min(a0, a1)) / float(max(a0, 1))
 
-    uni = color_uniformity_std(rgba, mask)   # lower => more uniform
-    edg = edge_density(rgba, mask)           # lower => less detail
-    hw = height_width_ratio_aligned(mask)    # lower => flatter
-    fill = bbox_fill_ratio(mask)             # higher => fills bbox
+    # Sole heuristics (kept as is, you can tune later)
+    uni = color_uniformity_std(rgba, mask)
+    edg = edge_density(rgba, mask)
+    hw = height_width_ratio_aligned(mask)
+    fill = bbox_fill_ratio(mask)
 
-    # Sole score: must be uniform, low edges, very flat, and fill most of bbox
     sole_score = 0.0
     if uni < 20.0:
         sole_score += 2.0
@@ -200,12 +199,8 @@ def score_image(path):
         "path": path,
         "pair_score": pair_score,
         "sole_score": float(sole_score),
-        "diagonal_score": diagonal_score,
-        "facing": facing,
-        "uni": float(uni),
-        "edg": float(edg),
-        "hw": float(hw),
-        "fill": float(fill),
+        "diagonal_score": float(diagonal_score),
+        "facing": int(facing),
     }
 
 
@@ -259,43 +254,66 @@ def assign_slots(items):
     return slots
 
 
-def safe_rename_in_folder(folder, mapping):
-    # Two-phase rename to avoid collisions
-    temp_paths = []
+def make_tmp_name(idx):
+    return "__tmp__" + str(idx) + "_" + os.urandom(6).hex() + ".png"
 
-    for num, item in mapping.items():
+
+def safe_rename_in_folder(folder, mapping):
+    """
+    Robust rename:
+    - Deletes old __tmp__*.png
+    - Renames each selected source file to a unique tmp name
+    - Then renames tmp -> final N.png
+    - If a file is referenced twice (duplicate), second time is skipped
+    """
+
+    # Delete leftover tmp files
+    for n in os.listdir(folder):
+        if n.startswith("__tmp__") and n.lower().endswith(".png"):
+            try:
+                os.remove(os.path.join(folder, n))
+            except Exception:
+                pass
+
+    tmp_map = {}  # final_num -> tmp_path
+
+    for final_num, item in mapping.items():
         old_path = item["path"]
-        tmp_name = f"__tmp__{num}__.png"
+
+        if not os.path.exists(old_path):
+            continue
+
+        tmp_name = make_tmp_name(final_num)
         tmp_path = os.path.join(folder, tmp_name)
 
-        j = 1
-        while os.path.exists(tmp_path):
-            tmp_name = f"__tmp__{num}__{j}__.png"
-            tmp_path = os.path.join(folder, tmp_name)
-            j += 1
-
         os.rename(old_path, tmp_path)
-        temp_paths.append((num, tmp_path))
+        tmp_map[final_num] = tmp_path
 
-    for num, tmp_path in temp_paths:
-        final_path = os.path.join(folder, f"{num}.png")
+    for final_num, tmp_path in tmp_map.items():
+        final_path = os.path.join(folder, f"{final_num}.png")
+
+        if os.path.exists(final_path):
+            try:
+                os.remove(final_path)
+            except Exception:
+                pass
+
         os.rename(tmp_path, final_path)
 
 
 def process_hd_folder(hd_path):
-    names = []
+    files = []
     for n in os.listdir(hd_path):
         full = os.path.join(hd_path, n)
         if os.path.isfile(full) and n.lower().endswith(".png"):
-            names.append(n)
+            files.append(full)
 
-    if not names:
+    if not files:
         return
 
     items = []
-    for n in names:
-        full = os.path.join(hd_path, n)
-        s = score_image(full)
+    for p in files:
+        s = score_image(p)
         if s is not None:
             items.append(s)
 

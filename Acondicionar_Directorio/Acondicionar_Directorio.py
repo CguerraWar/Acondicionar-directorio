@@ -7,6 +7,7 @@ import os
 
 ROOT_DIR = r"C:\Users\table\Documents\Carlos\Personales\B\Zapatos\Zapatillas Ninos"
 
+
 OUTPUT_WIDTH = 1500
 OUTPUT_HEIGHT = 1500
 MARGIN = 200
