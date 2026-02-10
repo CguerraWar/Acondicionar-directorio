@@ -2,7 +2,7 @@ import os
 import cv2
 import numpy as np
 
-ROOT_DIR = r"C:\Users\table\Documents\Carlos\Personales\B\Zapatos\Ballerinas\Listas\281"
+ROOT_DIR = r"C:\Users\table\Documents\Carlos\Personales\B\Zapatos"
 HD_FOLDER_NAME = "HD"
 
 ALPHA_THRESHOLD = 1
@@ -12,7 +12,7 @@ ALPHA_THRESHOLD = 1
 # 2 = right view
 # 3 = left view
 # 4 = diagonal/angle
-# 5 = sole
+# 5 = sole (uniform color, low detail, very flat, fills bbox)
 
 
 def read_rgba(path):
@@ -20,7 +20,6 @@ def read_rgba(path):
     if img is None:
         return None
     if img.shape[2] == 3:
-        # no alpha, create full alpha
         bgr = img
         a = np.full((img.shape[0], img.shape[1], 1), 255, dtype=np.uint8)
         img = np.concatenate([bgr, a], axis=2)
@@ -42,8 +41,19 @@ def bbox_from_mask(mask):
     return (x0, y0, x1 + 1, y1 + 1)
 
 
+def bbox_fill_ratio(mask):
+    bb = bbox_from_mask(mask)
+    if bb is None:
+        return 0.0
+    x0, y0, x1, y1 = bb
+    box_area = float((x1 - x0) * (y1 - y0))
+    if box_area <= 0.0:
+        return 0.0
+    obj_area = float((mask > 0).sum())
+    return obj_area / box_area
+
+
 def connected_components_areas(mask):
-    # mask is 0/255
     num, labels = cv2.connectedComponents((mask > 0).astype(np.uint8))
     if num <= 1:
         return []
@@ -75,20 +85,7 @@ def rotate_mask(mask, angle_deg):
     return rot
 
 
-def white_ratio(rgba, mask):
-    # compute ratio of near-white pixels inside object
-    bgr = rgba[:, :, :3]
-    inside = mask > 0
-    if inside.sum() < 200:
-        return 0.0
-    pix = bgr[inside]
-    # near-white in BGR
-    w = np.mean((pix[:, 0] > 200) & (pix[:, 1] > 200) & (pix[:, 2] > 200))
-    return float(w)
-
-
 def height_width_ratio_aligned(mask):
-    # align by PCA so major axis is horizontal
     ang = pca_angle_from_mask(mask)
     rot = rotate_mask(mask, -ang)
     bb = bbox_from_mask(rot)
@@ -101,9 +98,6 @@ def height_width_ratio_aligned(mask):
 
 
 def facing_direction_aligned(mask):
-    # returns +1 = facing right, -1 = facing left, 0 = unknown
-    # steps:
-    # 1) align by PCA to horizontal
     ang = pca_angle_from_mask(mask)
     rot = rotate_mask(mask, -ang)
     bb = bbox_from_mask(rot)
@@ -115,7 +109,6 @@ def facing_direction_aligned(mask):
     if w < 50 or h < 50:
         return 0
 
-    # 2) build thickness profile along x (vertical span for each column)
     obj_bin = (obj > 0).astype(np.uint8)
     spans = np.zeros(w, dtype=np.int32)
     for x in range(w):
@@ -126,22 +119,15 @@ def facing_direction_aligned(mask):
     if spans.max() == 0:
         return 0
 
-    # smooth
     k = max(3, int(w * 0.02))
     if k % 2 == 0:
         k += 1
     spans_s = cv2.GaussianBlur(spans.astype(np.float32).reshape(1, -1), (k, 1), 0).flatten()
 
-    # 3) compare average thickness in first/last 20%
     n = max(1, int(w * 0.2))
     left_mean = float(spans_s[:n].mean())
     right_mean = float(spans_s[-n:].mean())
 
-    # heuristic:
-    # toe area often has lower height than heel collar (heel higher),
-    # so the thicker end tends to be heel side.
-    # if left thicker => heel on left => facing right
-    # if right thicker => heel on right => facing left
     if abs(left_mean - right_mean) < 3.0:
         return 0
 
@@ -149,6 +135,28 @@ def facing_direction_aligned(mask):
         return +1
     else:
         return -1
+
+
+def color_uniformity_std(rgba, mask):
+    bgr = rgba[:, :, :3]
+    inside = mask > 0
+    if int(inside.sum()) < 200:
+        return 999.0
+    pix = bgr[inside].astype(np.float32)
+    std_b = float(np.std(pix[:, 0]))
+    std_g = float(np.std(pix[:, 1]))
+    std_r = float(np.std(pix[:, 2]))
+    return (std_b + std_g + std_r) / 3.0
+
+
+def edge_density(rgba, mask):
+    gray = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 80, 160)
+    inside = mask > 0
+    denom = float(int(inside.sum()))
+    if denom < 200.0:
+        return 1.0
+    return float(int(edges[inside].sum())) / denom
 
 
 def score_image(path):
@@ -161,70 +169,77 @@ def score_image(path):
     if bb is None:
         return None
 
-    # pair score from connected components
     areas = connected_components_areas(mask)
     total_area = int((mask > 0).sum())
     pair_score = 0.0
     if len(areas) >= 2 and total_area > 0:
-        # if 2 biggest components are both significant
         a0 = areas[0]
         a1 = areas[1]
         pair_score = float(min(a0, a1)) / float(max(a0, 1))
 
-    # sole score from white ratio
-    sole_score = white_ratio(rgba, mask)
+    uni = color_uniformity_std(rgba, mask)   # lower => more uniform
+    edg = edge_density(rgba, mask)           # lower => less detail
+    hw = height_width_ratio_aligned(mask)    # lower => flatter
+    fill = bbox_fill_ratio(mask)             # higher => fills bbox
 
-    # diagonal score from aligned h/w ratio
-    hw = height_width_ratio_aligned(mask)
-    diagonal_score = hw  # higher -> more diagonal/vertical volume
+    # Sole score: must be uniform, low edges, very flat, and fill most of bbox
+    sole_score = 0.0
+    if uni < 20.0:
+        sole_score += 2.0
+    if edg < 0.02:
+        sole_score += 2.0
+    if hw < 0.35:
+        sole_score += 3.0
+    if fill > 0.70:
+        sole_score += 3.0
 
-    # facing
+    diagonal_score = hw
     facing = facing_direction_aligned(mask)
 
     return {
         "path": path,
         "pair_score": pair_score,
-        "sole_score": sole_score,
+        "sole_score": float(sole_score),
         "diagonal_score": diagonal_score,
         "facing": facing,
+        "uni": float(uni),
+        "edg": float(edg),
+        "hw": float(hw),
+        "fill": float(fill),
     }
 
 
 def assign_slots(items):
-    # items: list of dicts
     unused = items[:]
     slots = {}
 
-    # slot 1: best pair
+    # 1 = pair crossed
     unused.sort(key=lambda d: d["pair_score"], reverse=True)
     if unused and unused[0]["pair_score"] >= 0.20:
         slots[1] = unused.pop(0)
 
-    # slot 5: best sole
+    # 5 = sole
     unused.sort(key=lambda d: d["sole_score"], reverse=True)
-    if unused and unused[0]["sole_score"] >= 0.20:
+    if unused and unused[0]["sole_score"] >= 6.0:
         slots[5] = unused.pop(0)
 
-    # slot 4: best diagonal among remaining
-    # typical side views have smaller h/w than diagonal; tune threshold if needed
+    # 4 = diagonal
     unused.sort(key=lambda d: d["diagonal_score"], reverse=True)
     if unused and unused[0]["diagonal_score"] >= 0.55:
         slots[4] = unused.pop(0)
 
-    # remaining: try to pick right/left by facing direction
+    # 2 and 3 = right / left
     right_candidates = [d for d in unused if d["facing"] == +1]
     left_candidates = [d for d in unused if d["facing"] == -1]
-    unknown_candidates = [d for d in unused if d["facing"] == 0]
 
-    # choose strongest by diagonal_score lower (more side-like) for 2 and 3
     right_candidates.sort(key=lambda d: d["diagonal_score"])
     left_candidates.sort(key=lambda d: d["diagonal_score"])
-    unknown_candidates.sort(key=lambda d: d["diagonal_score"])
 
     if 2 not in slots:
         if right_candidates:
             slots[2] = right_candidates.pop(0)
-            unused.remove(slots[2])
+            if slots[2] in unused:
+                unused.remove(slots[2])
         elif unused:
             slots[2] = unused.pop(0)
 
@@ -236,7 +251,7 @@ def assign_slots(items):
         elif unused:
             slots[3] = unused.pop(0)
 
-    # fill remaining slots in order 1..5 if missing and we still have images
+    # Fill missing slots with remaining images
     for s in [1, 2, 3, 4, 5]:
         if s not in slots and unused:
             slots[s] = unused.pop(0)
@@ -245,8 +260,7 @@ def assign_slots(items):
 
 
 def safe_rename_in_folder(folder, mapping):
-    # mapping: {final_number: path}
-    # two-phase rename to avoid collisions
+    # Two-phase rename to avoid collisions
     temp_paths = []
 
     for num, item in mapping.items():
@@ -278,7 +292,6 @@ def process_hd_folder(hd_path):
     if not names:
         return
 
-    # score all images
     items = []
     for n in names:
         full = os.path.join(hd_path, n)
@@ -291,13 +304,10 @@ def process_hd_folder(hd_path):
 
     slots = assign_slots(items)
 
-    # build mapping and rename
     mapping = {}
     for num, item in slots.items():
         mapping[num] = item
 
-    # only rename slots that exist
-    # also, do not require all 1..5 to be present
     safe_rename_in_folder(hd_path, mapping)
 
     print("OK:", hd_path, "renamed:", sorted(mapping.keys()))
@@ -313,6 +323,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
-
-
